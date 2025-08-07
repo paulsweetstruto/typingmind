@@ -1,0 +1,318 @@
+hs_auth: &hs_auth
+  auth:
+    # MEPS Sandbox
+    token: xxxxxxxx
+    # MEPS production
+    #token: xxxxxxxx
+
+sage_auth: &sage_auth
+  auth:
+    # Struto Sage 50 sandbox
+    #baseUrl: "xxxxxxxx"
+    #authToken: "xxxxxxxx"
+    #MEPS production
+    baseUrl: xxxxxxxx
+    authToken:xxxxxxxx
+
+
+# ------------------ MEPS Sandbox ------------------
+# Hubspot custom object to keep track of transactions in sage, see create-custom-objects.http
+sage_transactions: &sage_transactions "2-136455322"
+# Association id between sage_transactions and deals
+association_type: &association_type "209"
+# Custom event to log on the deal when a sage credit note was created
+custom_event_credit_note_created: &custom_event_credit_note_created "pe142111455_sage_credit_note_created"
+# 0%
+hs_tax_rate_id_T0: &hs_tax_rate_id_T0 "116141340"
+# 20%
+hs_tax_rate_id_T1: &hs_tax_rate_id_T1 "116141341"
+
+# ------------------ MEPS Production ------------------
+# Hubspot custom object to keep track of transactions in sage, see create-custom-objects.http
+#sage_transactions: &sage_transactions "2-144676698"
+# Association id between sage_transactions and deals
+#association_type: &association_type "81"
+# Custom event to log on the deal when a sage credit note was created
+#custom_event_credit_note_created: &custom_event_credit_note_created "pe139486962_sage_credit_note_created"
+# 0%
+#hs_tax_rate_id_T0: &hs_tax_rate_id_T0 "116383206"
+# 20%
+#hs_tax_rate_id_T1: &hs_tax_rate_id_T1 "116383205"
+
+# See StockCodeS3
+sage_stock_code: &sage_stock_code "S3"
+# See invoiceTypeCode.InvoiceTypeProductCreditNote
+sage_invoice_type: &sage_invoice_type "3"
+sage_currency_code: &sage_currency_code "1"
+sage_lineitem_nominal_code : &sage_lineitem_nominal_code "4000"
+
+pipeline:
+  name: Hubspot Deal to Sage 50 Invoice Credit Note
+  description: >-
+    Get credit note Deal from Hubspot and create a Sage 50 credit note (HubSpot does not cater for invoice credit notes)
+  key: MEPS-H2-SAGE-CREDIT
+  nodes:
+
+    - name: Get Hubspot Credit Note Deals
+      description: >-
+        Get Hubspot Credit Note Deals from Hubspot
+      connector: Hubspot
+      run: extract
+      skip: false
+      config:
+        <<: *hs_auth
+        extractor:
+          - table: deals
+            fields:
+              - amount
+              - sage_50_tax_code
+              - sage_50_credit_note_reference
+              - sage_50_customer_reference
+              - sage_50_invoice_address1
+              - sage_50_invoice_address2
+              - sage_50_invoice_address3
+              - sage_50_invoice_address4
+              - sage_50_invoice_address5
+              - closedate
+              - createdate
+              - payment_date
+              - dealname
+              - dealstage
+              - pipeline
+            filters:
+              - property: sage_50_create_credit_note
+                operator: EQ
+                value: "REQUEST"
+                #- property: hs_object_id
+                #  operator: EQ
+                #  value: 207811641587
+
+    - name: Get line items for credit note deal
+      description: >-
+        Get line items for credit note deal
+      connector: Hubspot
+      run: extract
+      skip: false
+      config:
+        <<: *hs_auth
+        extractor:
+          - extract: association
+            table: line_items
+            source_type: "deal"
+            source_id: 'deals.hs_object_id'
+            target: 'deals.line_items'
+            fields:
+              - hs_object_id
+              - name
+              - hs_sku
+              - quantity
+              - amount
+              - price
+              - discount
+              - hs_tax_rate_group_id
+              - hs_post_tax_amount
+              - hs_tax_amount
+
+    - name: Check for an existing transaction
+      description: Get lastest transaction custom objects to see if the credit note has already been created
+      connector: Hubspot
+      run: transform
+      skip: false
+      config:
+        <<: *hs_auth
+        transformer:
+
+          - table: *sage_transactions
+            transformation: findBySearch
+            object_output: hs_transactions
+            properties:
+              - sage_activity_type
+              - hubspot_invoice_reference
+              - hubspot_payment_reference
+              - transaction_amount
+              - sage_50_reference
+              - is_error
+
+            filterGroups:
+              - filters:
+                  - property: is_error
+                    operator: EQ
+                    value: false
+                  - property: sage_50_reference
+                    operator: HAS_PROPERTY
+                  - property: sage_activity_type
+                    operator: EQ
+                    value: "CREDIT"
+                  - property: hubspot_credit_note_deal_reference
+                    operator: EQ
+                    value: "#{COREDOC|$.deals.hs_object_id}"
+              - filters:
+                  - property: is_error
+                    operator: EQ
+                    value: true
+                  - property: sage_activity_type
+                    operator: EQ
+                    value: "CREDIT"
+                  - property: hubspot_credit_note_deal_reference
+                    operator: EQ
+                    value: "#{COREDOC|$.deals.hs_object_id}"
+                  - property: hs_createdate
+                    operator: GTE
+                    value: "#{10.minutes_ago|RFC3339}"
+            sorts:
+              - propertyName: hs_createdate
+                direction: DESCENDING
+
+    - name: Create credit note invoice in Sage 50
+      description: >-
+        Create credit note invoice in Sage 50 from a credit note deal
+      connector: Sage50v1
+      run: load
+      config:
+        <<: *sage_auth
+        loader:
+
+          - type: credit_note
+            skip_if_present: hs_transactions[0].properties.sage_50_reference
+            sage_config:
+              customer_ref: "deals.sage_50_customer_reference"
+              id_field: deals.sage_50_credit_note_reference
+              tax_codes:
+                - hs_tax_rate_group_id: *hs_tax_rate_id_T0
+                  sage_tax_code: "0"
+                - hs_tax_rate_group_id: *hs_tax_rate_id_T1
+                  sage_tax_code: "1"
+              field_links:
+                - source: *sage_invoice_type
+                  target: invoiceTypeCode
+                - source: "deals.createdate"
+                  target: invoiceDate
+                - source: "true"
+                  target: ignoreCustomerDiscountRate
+                - source: "deals.sage_50_invoice_address1"
+                  target: address1
+                - source: "deals.sage_50_invoice_address2"
+                  target: address2
+                - source: "deals.sage_50_invoice_address3"
+                  target: address3
+                - source: "deals.sage_50_invoice_address4"
+                  target: address4
+                - source: "deals.sage_50_invoice_address5"
+                  target: address5
+                - source: *sage_currency_code
+                  target: currency
+                - source: "deals.hs_object_id"
+                  target: customerOrderNumber
+                - source: "deals.sage_50_customer_reference"
+                  target: customerAccountRef
+                - source: *sage_currency_code
+                  target: currency
+                - source: "true"
+                  target: shouldUpdateLedgers
+
+              line_item:
+                line_item_description: CommasSeparatedLineItemBuilder
+                field_links:
+                  - source: *sage_stock_code
+                    target: stockCode
+                  - source: "1"
+                    target: quantity
+                  - source: "Each"
+                    target: unitOfSale
+                  - source: "deals.amount"
+                    target: unitPrice
+                  - source: "deals.sage_50_tax_code"
+                    target: taxCode
+                  - source: "deals.sage_50_tax_percentage"
+                    #taxRate is a percentage, for eg 20
+                    target: taxRate
+                  - source: *sage_lineitem_nominal_code
+                    target: nominal
+                  - source: "deals.hs_object_id"
+                    target: details
+
+    - name: Log a custom event on the deal if the credit note was created in Sage
+      description: Add a custom event on the deal to indicate that the credit note was created in Sage
+      connector: Hubspot
+      run: load
+      skip: false
+      config:
+        <<: *hs_auth
+        loader:
+          - table: events
+            skip_if_true: "[sage_response.isError] == true || [sage_response.invoiceNumber] == ''"
+            skip_existence_check: true
+            create_missing: true
+            payload_links:
+              - source: deals.hs_object_id
+                target: objectId
+            payload_values:
+              - value: *custom_event_credit_note_created
+                target: eventName
+            field_links:
+              - source: sage_response.invoiceNumber
+                target: sage_50_credit_note_reference
+              - source: deals.hs_object_id
+                target: hubspot_deal_reference
+            field_values:
+              - value: "Credit note created in Sage"
+                target: description
+
+    - name: Add an entry to the Sage transaction custom object
+      description: Add the Sage transaction to the custom object in HubSpot to keep track of Sage transactions
+      connector: Hubspot
+      run: load
+      skip: false
+      config:
+        <<: *hs_auth
+        loader:
+
+          # don't add a new transaction if the current sage api call failed
+          # and the last transaction is also an error
+          - table: *sage_transactions
+            skip_if_present: hs_transactions[0].properties.sage_50_reference
+            create_missing: true
+            skip_existence_check: false
+            id_field: hs_transactions.0.id
+            new_id_field: transaction_id
+            field_links:
+              - source: sage_response.invoiceNumber
+                target: sage_50_reference
+              - source: deals.hs_object_id
+                target: hubspot_credit_note_deal_reference
+              - source: deals.amount
+                target: transaction_amount
+              - source: sage_response.createError
+                target: description
+              - source: sage_response.isError
+                target: is_error
+            field_values:
+              - value: "CREDIT"
+                target: sage_activity_type
+
+            associations:
+              - from_id: transaction_id
+                from_type: *sage_transactions
+                to_id: deals.hs_object_id
+                to_type: deals
+                association_type_id: *association_type
+                association_category: USER_DEFINED
+
+    - name: Update the deal with the Sage 50 response
+      description: >-
+        Update the deal with the Sage 50 response
+      connector: Hubspot
+      run: load
+      skip: false
+      config:
+        <<: *hs_auth
+        loader:
+          - table: deals
+            id_field: deals.hs_object_id
+            field_links:
+              - source: sage_response.invoiceNumber
+                target: sage_50_credit_note_reference
+              - source: sage_response.creditNoteStatus
+                target: sage_50_create_credit_note
+              - source: sage_response.createError
+                target: sage_50_credit_note_error
